@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"rust-analyzer.linkedProjects": [
+			"./yardd_disk/Cargo.toml"
+		]
+	}
+}

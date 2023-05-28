@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "yardd_disk",
+    "yardd_app"
+]
