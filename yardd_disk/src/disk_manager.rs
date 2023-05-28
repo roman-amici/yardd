@@ -84,7 +84,10 @@ impl DiskManager {
             .get(&page_id)
             .expect("Attempt to save a page with unknown id");
 
-        let mut file = File::open(&page_entry.file_path)?;
+        let mut file = File::options()
+            .write(true)
+            .open(&page_entry.file_path)
+            .expect("Failed to open file.");
 
         file.seek(SeekFrom::Start(page_entry.offset))?;
         file.write_all(data)?;

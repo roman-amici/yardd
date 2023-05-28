@@ -1,4 +1,5 @@
 use std::{
+    cmp::min,
     collections::BTreeMap,
     sync::{Arc, RwLock},
 };
@@ -20,26 +21,29 @@ pub struct PageManager {
 }
 
 impl PageManager {
-    pub fn new() -> PageManager {
-        let mut manager = PageManager {
-            disk_manager: DiskManager::new("./"),
+    pub fn new(max_num_pages: usize, base_directory: &str) -> PageManager {
+        PageManager {
+            disk_manager: DiskManager::new(base_directory),
             usage_tracker: UsageTracker::new(),
             pages: BTreeMap::new(),
             empty_pages: vec![],
-            max_num_pages: 50,
-        };
-
-        let empty_pages = manager.disk_manager.allocate_pages(100, "db.yard").unwrap();
-
-        let len = manager.empty_pages.len() / 2;
-
-        for id in empty_pages.iter().rev().take(len) {
-            manager.add_free_page(*id);
+            max_num_pages,
         }
+    }
 
-        manager.empty_pages = empty_pages;
+    pub fn add_empty_pages(&mut self, file: &str, n_pages: usize) {
+        let empty_pages = self.disk_manager.allocate_pages(n_pages, file).unwrap();
 
-        manager
+        let buffer_spots = self.max_num_pages - self.pages.len();
+        let len = min(buffer_spots, n_pages);
+
+        for (i, id) in empty_pages.iter().enumerate() {
+            if i < len {
+                self.add_free_page(*id);
+            } else {
+                self.empty_pages.push(*id);
+            }
+        }
     }
 
     fn add_free_page(&mut self, page_id: PageId) {
@@ -51,10 +55,12 @@ impl PageManager {
         }));
         self.pages.insert(page_id, page);
         self.usage_tracker.insert(page_id);
+
+        self.empty_pages.push(page_id);
     }
 
     pub fn next_free_page(&mut self) -> PagePointer {
-        if (self.empty_pages.len() == 0) {
+        if self.empty_pages.len() == 0 {
             panic!("No empty pages left"); // out of memory
         }
 
@@ -62,8 +68,6 @@ impl PageManager {
         let page_id = self.empty_pages.pop().unwrap();
 
         let page = self.find_page(page_id);
-
-        self.usage_tracker.touch(page_id);
 
         page
     }
@@ -124,5 +128,185 @@ impl PageManager {
         } else {
             self.load_page(page_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod page_manager_tests {
+    use std::{
+        fs::{create_dir_all, remove_dir_all},
+        path::Path,
+    };
+
+    use crate::page::PAGE_SIZE_BYTES;
+
+    use super::PageManager;
+
+    fn setup_test_dir(base_dir: &str) {
+        let path = Path::new(base_dir);
+        create_dir_all(path).expect("Failed to create test directory.");
+    }
+
+    fn cleanup(base_dir: &str) {
+        let _ = remove_dir_all(base_dir);
+    }
+
+    #[test]
+    pub fn allocate_empty_pages() {
+        let base_dir = "./test1";
+        setup_test_dir(base_dir);
+
+        let mut manager = PageManager::new(50, base_dir);
+
+        manager.add_empty_pages("empty.db", 100);
+
+        assert_eq!(manager.pages.len(), 50);
+        assert_eq!(manager.usage_tracker.last_used.len(), 50);
+
+        cleanup(base_dir);
+    }
+
+    #[test]
+    pub fn write_free_page_persisted() {
+        let base_dir = "./test2";
+        setup_test_dir(base_dir);
+
+        let mut manager = PageManager::new(1, base_dir);
+        manager.add_empty_pages("empty.db", 2);
+
+        let page_id_1 = {
+            let page = manager.next_free_page();
+            let mut page = page.write().expect("Failed to unlock mutex");
+            page.data.fill(88);
+            page.page_id
+        };
+
+        let page_id_2 = {
+            let page = manager.next_free_page();
+            let mut page = page.write().expect("Failed to unlock mutex");
+            page.data.fill(77);
+            page.page_id
+        };
+
+        assert_eq!(manager.pages.len(), 1);
+        assert_eq!(manager.usage_tracker.last_used.len(), 1);
+
+        {
+            let page = manager.find_page(page_id_1);
+            let page = page.read().expect("Failed to unlock mutex");
+
+            assert_eq!(page.data.len() as u64, PAGE_SIZE_BYTES);
+            for b in page.data.iter() {
+                assert_eq!(*b, 88);
+            }
+        }
+
+        assert_eq!(manager.pages.len(), 1);
+        assert_eq!(manager.usage_tracker.last_used.len(), 1);
+
+        {
+            let page = manager.find_page(page_id_2);
+            let page = page.read().expect("Failed to unlock mutex");
+
+            assert_eq!(page.data.len() as u64, PAGE_SIZE_BYTES);
+            for b in page.data.iter() {
+                assert_eq!(*b, 77);
+            }
+        }
+
+        cleanup(base_dir);
+    }
+
+    #[test]
+    fn evict_lru_page() {
+        let base_dir = "./test2";
+        setup_test_dir(base_dir);
+
+        let mut manager = PageManager::new(2, base_dir);
+        manager.add_empty_pages("empty.db", 3);
+
+        let page_id_1 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        let page_id_2 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        let page_id_3 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        assert_eq!(manager.empty_pages.len(), 0);
+        assert_eq!(manager.pages.len(), 2);
+
+        // Ensure that pages 1 and 2 are the most recently used
+        {
+            let _page_1 = manager.find_page(page_id_1);
+            let _page_2 = manager.find_page(page_id_2);
+        }
+
+        let (id, _) = manager.usage_tracker.last_used.peek().unwrap();
+        assert_eq!(*id, page_id_1);
+
+        {
+            let _page = manager.find_page(page_id_3);
+        }
+
+        let (id, _) = manager.usage_tracker.last_used.peek().unwrap();
+        assert_eq!(*id, page_id_2);
+
+        cleanup(base_dir);
+    }
+
+    #[test]
+    pub fn page_with_reference_is_not_evicted() {
+        let base_dir = "./test3";
+        setup_test_dir(base_dir);
+
+        let mut manager = PageManager::new(2, base_dir);
+        manager.add_empty_pages("empty.db", 3);
+
+        let page_id_1 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        let page_id_2 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        let page_id_3 = {
+            let page = manager.next_free_page();
+            let page = page.read().unwrap();
+            page.page_id
+        };
+
+        // Hold on to the reference to page_1
+        let _page_1 = manager.find_page(page_id_1);
+        {
+            let _page_2 = manager.find_page(page_id_2);
+        }
+
+        let (id, _) = manager.usage_tracker.last_used.peek().unwrap();
+        assert_eq!(*id, page_id_1);
+
+        {
+            let _page = manager.find_page(page_id_3);
+        }
+
+        let (id, _) = manager.usage_tracker.last_used.peek().unwrap();
+        assert_eq!(*id, page_id_1);
+
+        cleanup(base_dir);
     }
 }
