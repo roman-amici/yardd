@@ -195,7 +195,7 @@ mod page_manager_tests {
             let page = manager.find_page(page_id_1);
             let page = page.read().expect("Failed to unlock mutex");
 
-            assert_eq!(page.data.len() as u64, PAGE_SIZE_BYTES);
+            assert_eq!(page.data.len() as u16, PAGE_SIZE_BYTES);
             for b in page.data.iter() {
                 assert_eq!(*b, 88);
             }
@@ -208,7 +208,7 @@ mod page_manager_tests {
             let page = manager.find_page(page_id_2);
             let page = page.read().expect("Failed to unlock mutex");
 
-            assert_eq!(page.data.len() as u64, PAGE_SIZE_BYTES);
+            assert_eq!(page.data.len() as u16, PAGE_SIZE_BYTES);
             for b in page.data.iter() {
                 assert_eq!(*b, 77);
             }

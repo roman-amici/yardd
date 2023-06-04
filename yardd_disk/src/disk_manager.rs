@@ -44,14 +44,14 @@ impl DiskManager {
         let mut file = File::create(&path)?;
 
         // Create a file with the size to fill all the pages
-        file.seek(SeekFrom::Start(pages as u64 * PAGE_SIZE_BYTES))?;
+        file.seek(SeekFrom::Start((pages * PAGE_SIZE_BYTES as usize) as u64))?;
         file.write(&[0])?;
 
         let mut page_ids = vec![];
         for i in 0..pages {
             let entry = DiskEntry {
                 file_path: path.clone(),
-                offset: (i as u64 * PAGE_SIZE_BYTES) as u64,
+                offset: (i as u16 * PAGE_SIZE_BYTES) as u64,
                 page_id: self.next_page_id(),
             };
 
