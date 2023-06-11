@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, mem::size_of};
+use std::{io::Write, marker::PhantomData, mem::size_of};
 
 use crate::{
     page::{
@@ -28,7 +28,7 @@ where
     }
 
     fn read_key_node(&'a self, slot_index: SlotIndex) -> KeyEntry<KeyType> {
-        let offset = self.inner_page().get_slot_offset(slot_index);
+        let offset = self.get_entry_offset(slot_index);
 
         let page_id = read_u64(&self.inner_page().data, offset);
 
@@ -52,6 +52,11 @@ where
             page_id,
             slot_index,
         }
+    }
+
+    fn slots_end(&'a self) -> usize {
+        let u16_size = size_of::<u16>();
+        SLOTS_START + (self.read_n_slots() + self.read_fragmented_slots()) as usize * u16_size
     }
 
     fn get_entry_offset(&'a self, slot_index: SlotIndex) -> usize {
@@ -97,6 +102,21 @@ where
     }
 }
 
+pub trait IndexPageReadSized<'a, KeyType>
+where
+    Self: IndexPageRead<'a, KeyType> + Sized,
+    KeyType: DbColumn,
+{
+    fn iter(&'a self) -> PageIterator<'a, KeyType> {
+        PageIterator {
+            index_node: self,
+            n_slots: self.read_n_slots(),
+            slot_index: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct KeyEntry<KeyType>
 where
     KeyType: DbColumn,
@@ -133,7 +153,6 @@ where
     pub fn init_page(page_type: PageType, parent_page_id: PageId, page: &'a mut Page) -> Self {
         let header = PageHeader {
             magic_number: PAGE_MAGIC_NUMBER,
-            bytes_remaining: PAGE_SIZE_BYTES as u16 - INDEX_PAGE_HEADER_SIZE as u16,
             page_type,
             log_sequence_number: 0,
             parent_page_id,
@@ -147,13 +166,15 @@ where
             phantom: PhantomData,
         };
 
-        node_page.set_n_slots(0);
+        let slots_header = SlotHeader {
+            occupied_slots: 0,
+            fragmented_slots: 0,
+            next_empty_offset: (node_page.inner_page.page_size() - 1) as u16,
+        };
+
+        node_page.write_slots_header(&slots_header);
 
         node_page
-    }
-
-    pub fn set_n_slots(&mut self, n_slots: u16) {
-        write_u16(&mut self.inner_page.data, SLOTS_HEADER_START, n_slots);
     }
 
     pub fn as_read_only(&'a self) -> IndexPage<'a, KeyType> {
@@ -163,29 +184,44 @@ where
         }
     }
 
+    fn write_entry(&mut self, new_entry: KeyEntry<KeyType>, offset: usize) {
+        let mut cursor = offset;
+        cursor = write_u64(&mut self.inner_page.data, cursor, new_entry.page_id);
+
+        cursor = write_u16(
+            &mut self.inner_page.data,
+            cursor,
+            new_entry.slot_index.unwrap_or_default(),
+        );
+
+        let bytes = new_entry.key.to_bytes();
+        write_bytes(&mut self.inner_page.data, cursor, &bytes);
+    }
+
     pub fn append_key(&mut self, new_entry: KeyEntry<KeyType>) {
-        let key_bytes = new_entry.key.to_bytes();
-        let entry_size_bytes = key_bytes.len() + TUPLE_HEADER_SIZE;
+        self.inner_page.is_dirty = true;
+
+        let entry_size_bytes = new_entry.key.len() + TUPLE_HEADER_SIZE;
+
+        let slots_header = self.read_slots_header();
+        let offset_start = slots_header.next_empty_offset as usize - entry_size_bytes;
 
         // size of entry + a new slot
-        if entry_size_bytes + size_of::<u16>() > self.inner_page.read_bytes_remaining() as usize {
+        if offset_start < self.slots_end() {
             // TODO: Add linked pages
             panic!("No more space left for page!")
         }
 
-        let slots_header = self.read_slots_header();
-
         let mut insert_index = slots_header.occupied_slots;
         for (slot_index, entry) in self.iter().enumerate() {
-            if new_entry.key > entry.key {
+            if new_entry.key <= entry.key {
                 insert_index = slot_index as u16;
                 break;
             }
         }
 
-        let offset_start = slots_header.next_empty_offset as usize - entry_size_bytes;
-
         self.insert_slot(insert_index as usize, offset_start);
+        self.write_entry(new_entry, offset_start);
     }
 
     pub fn write_slots_header(&mut self, slots_header: &SlotHeader) {
@@ -212,6 +248,8 @@ where
         slots_fragmented: Vec<usize>,
         next_empty_offset: usize,
     ) {
+        self.inner_page.is_dirty = true;
+
         let header = SlotHeader {
             occupied_slots: slots.len() as u16,
             fragmented_slots: slots_fragmented.len() as u16,
@@ -242,12 +280,9 @@ where
         self.update_slots(slots, slots_fragmented, offset_start - 1);
     }
 
-    fn iter(&'a self) -> PageIterator<'a, KeyType> {
-        PageIterator {
-            index_node: self,
-            n_slots: self.read_n_slots(),
-            slot_index: 0,
-        }
+    // TODO: figure out a better way to do this rather than duplicating it
+    fn find_entry(&self, key: &KeyType) -> Option<KeyEntry<KeyType>> {
+        self.iter().find(|entry| entry.key == *key)
     }
 }
 
@@ -260,6 +295,11 @@ where
     }
 }
 
+impl<'a, KeyType> IndexPageReadSized<'a, KeyType> for IndexPageMut<'a, KeyType> where
+    KeyType: DbColumn
+{
+}
+
 impl<'a, KeyType> IndexPage<'a, KeyType>
 where
     KeyType: DbColumn,
@@ -268,14 +308,6 @@ where
         IndexPage {
             inner_page: page,
             phantom: PhantomData,
-        }
-    }
-
-    fn iter(&'a self) -> PageIterator<'a, KeyType> {
-        PageIterator {
-            index_node: self,
-            n_slots: self.read_n_slots(),
-            slot_index: 0,
         }
     }
 }
@@ -288,6 +320,8 @@ where
         self.inner_page
     }
 }
+
+impl<'a, KeyType> IndexPageReadSized<'a, KeyType> for IndexPage<'a, KeyType> where KeyType: DbColumn {}
 
 pub struct PageIterator<'a, KeyType>
 where
@@ -316,24 +350,180 @@ where
 }
 
 mod test {
-    use std::sync::{Arc, RwLock};
+    use std::{
+        marker::PhantomData,
+        sync::{Arc, RwLock},
+    };
 
-    use crate::page::{Page, PageType};
+    use crate::{
+        disk_btree::IndexPageRead,
+        page::{Page, PageType, SlotHeader},
+    };
 
-    use super::IndexPageMut;
+    use super::{IndexPageMut, IndexPageReadSized, KeyEntry};
 
     #[test]
-    pub fn test() {
-        let page = Page {
+    pub fn read_write_slots_header() {
+        let mut page = Page {
             data: vec![0; 1024],
             page_id: 0,
             is_dirty: false,
         };
 
-        let x = Arc::new(RwLock::new(page));
+        let mut index_page = IndexPageMut::<u64> {
+            inner_page: &mut page,
+            phantom: PhantomData,
+        };
 
-        let mut page_guard = x.write().unwrap();
+        let slots_header = SlotHeader {
+            occupied_slots: 0xFAFA,
+            fragmented_slots: 0xAFAF,
+            next_empty_offset: 0xEAFA,
+        };
 
-        let index_page = IndexPageMut::<u64>::init_page(PageType::IndexNode, 0, &mut page_guard);
+        index_page.write_slots_header(&slots_header);
+
+        let header_read = index_page.read_slots_header();
+
+        assert_eq!(slots_header.occupied_slots, header_read.occupied_slots);
+        assert_eq!(slots_header.fragmented_slots, header_read.fragmented_slots);
+        assert_eq!(
+            slots_header.next_empty_offset,
+            header_read.next_empty_offset
+        );
+    }
+
+    #[test]
+    pub fn init_index_page() {
+        let mut page = Page {
+            data: vec![0; 1024],
+            page_id: 0,
+            is_dirty: false,
+        };
+        let index_page = IndexPageMut::<u64>::init_page(PageType::IndexNode, 123, &mut page);
+
+        let slots_header = index_page.read_slots_header();
+
+        assert_eq!(0, slots_header.occupied_slots);
+        assert_eq!(0, slots_header.fragmented_slots);
+        assert_eq!(1023, slots_header.next_empty_offset);
+
+        let header = page.read_header();
+        assert_eq!(PageType::IndexNode, header.page_type);
+        assert_eq!(page.page_id, header.page_id);
+        assert_eq!(123, header.parent_page_id);
+        assert!(page.is_dirty);
+    }
+
+    #[test]
+    pub fn add_key() {
+        let mut page = Page {
+            data: vec![0; 1024],
+            page_id: 0,
+            is_dirty: false,
+        };
+
+        let mut index_page = IndexPageMut::<u64>::init_page(PageType::IndexNode, 123, &mut page);
+
+        index_page.append_key(KeyEntry {
+            key: 23,
+            page_id: 345,
+            slot_index: Some(289),
+        });
+
+        assert!(index_page.inner_page.is_dirty);
+
+        let slots_header = index_page.read_slots_header();
+        assert_eq!(0, slots_header.fragmented_slots);
+        assert_eq!(1, slots_header.occupied_slots);
+
+        let entry = index_page.find_entry(&23).expect("Key not found");
+        assert_eq!(23, entry.key);
+        assert_eq!(345, entry.page_id);
+        assert_eq!(None, entry.slot_index);
+    }
+
+    #[test]
+    pub fn add_key_reverse_insertion_order() {
+        let mut page = Page {
+            data: vec![0; 1024],
+            page_id: 0,
+            is_dirty: false,
+        };
+
+        let mut index_page = IndexPageMut::<u64>::init_page(PageType::IndexNode, 123, &mut page);
+
+        index_page.append_key(KeyEntry {
+            key: 3,
+            page_id: 14,
+            slot_index: None,
+        });
+
+        index_page.append_key(KeyEntry {
+            key: 2,
+            page_id: 15,
+            slot_index: None,
+        });
+
+        index_page.append_key(KeyEntry {
+            key: 1,
+            page_id: 16,
+            slot_index: None,
+        });
+
+        let mut iterator = index_page.iter();
+        let entry1 = iterator.next().expect("Expected key");
+        assert_eq!(1, entry1.key);
+        assert_eq!(16, entry1.page_id);
+
+        let entry2 = iterator.next().expect("Expected key");
+        assert_eq!(2, entry2.key);
+        assert_eq!(15, entry2.page_id);
+
+        let entry3 = iterator.next().expect("Expected key");
+        assert_eq!(3, entry3.key);
+        assert_eq!(14, entry3.page_id);
+    }
+
+    #[test]
+    pub fn add_key_insertion_order() {
+        let mut page = Page {
+            data: vec![0; 1024],
+            page_id: 0,
+            is_dirty: false,
+        };
+
+        let mut index_page = IndexPageMut::<u64>::init_page(PageType::IndexNode, 123, &mut page);
+
+        index_page.append_key(KeyEntry {
+            key: 1,
+            page_id: 14,
+            slot_index: None,
+        });
+
+        index_page.append_key(KeyEntry {
+            key: 2,
+            page_id: 15,
+            slot_index: None,
+        });
+
+        index_page.append_key(KeyEntry {
+            key: 3,
+            page_id: 16,
+            slot_index: None,
+        });
+
+        let mut iterator = index_page.iter();
+        let entry1 = iterator.next().expect("Expected key");
+        assert_eq!(1, entry1.key);
+        assert_eq!(14, entry1.page_id);
+
+        let entry2 = iterator.next().expect("Expected key");
+        assert_eq!(2, entry2.key);
+        assert_eq!(15, entry2.page_id);
+
+        let entry3 = iterator.next().expect("Expected key");
+        assert_eq!(3, entry3.key);
+        assert_eq!(16, entry3.page_id);
     }
 }

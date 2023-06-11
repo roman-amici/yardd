@@ -8,9 +8,9 @@ pub type PageId = u64;
 pub type SlotIndex = u16;
 
 pub struct Page {
-    pub page_id: PageId,
     pub data: Vec<u8>,
     pub is_dirty: bool,
+    pub page_id: PageId,
 }
 
 #[derive(Debug, PartialEq)]
@@ -36,8 +36,7 @@ pub const PAGE_TYPE_START: usize = MAGIC_NUMBER_START + size_of::<u32>();
 pub const LOG_SEQUENCE_NUMBER_START: usize = PAGE_TYPE_START + size_of::<u8>();
 pub const PARENT_PAGE_ID_START: usize = LOG_SEQUENCE_NUMBER_START + size_of::<u32>();
 pub const PAGE_ID_START: usize = PARENT_PAGE_ID_START + size_of::<PageId>();
-pub const BYTES_REMAINING_START: usize = PAGE_ID_START + size_of::<PageId>();
-pub const HEADER_SIZE: usize = PAGE_ID_START + size_of::<u16>();
+pub const HEADER_SIZE: usize = PAGE_ID_START + size_of::<PageId>();
 
 pub const SLOTS_HEADER_START: usize = HEADER_SIZE;
 pub const SLOTS_OCCUPIED_SLOTS_START: usize = SLOTS_HEADER_START;
@@ -58,7 +57,6 @@ pub struct PageHeader {
     pub log_sequence_number: u32,
     pub parent_page_id: PageId,
     pub page_id: PageId,
-    pub bytes_remaining: u16,
 }
 
 impl Page {
@@ -69,11 +67,12 @@ impl Page {
             log_sequence_number: read_u32(&self.data, LOG_SEQUENCE_NUMBER_START),
             parent_page_id: read_u64(&self.data, PARENT_PAGE_ID_START),
             page_id: self.read_page_id(),
-            bytes_remaining: self.read_bytes_remaining(),
         }
     }
 
     pub fn write_header(&mut self, header: PageHeader) {
+        self.is_dirty = true;
+
         self.page_id = header.page_id;
 
         write_u32(&mut self.data, MAGIC_NUMBER_START, header.magic_number);
@@ -85,11 +84,6 @@ impl Page {
         );
         write_u64(&mut self.data, PARENT_PAGE_ID_START, header.parent_page_id);
         write_u64(&mut self.data, PAGE_ID_START, header.page_id);
-        write_u16(
-            &mut self.data,
-            BYTES_REMAINING_START,
-            header.bytes_remaining,
-        );
     }
 
     pub fn read_page_id(&self) -> PageId {
@@ -98,10 +92,6 @@ impl Page {
 
     pub fn read_page_type(&self) -> PageType {
         self.data[PAGE_TYPE_START].into()
-    }
-
-    pub fn read_bytes_remaining(&self) -> u16 {
-        read_u16(&self.data, BYTES_REMAINING_START)
     }
 
     pub fn as_index_node<'a, KeyType>(&'a self) -> IndexPage<'a, KeyType>
@@ -116,18 +106,18 @@ impl Page {
         IndexPage::read_existing_page(self)
     }
 
-    pub fn get_slot_offset(&self, slot_index: SlotIndex) -> usize {
-        let start = SLOTS_START + std::mem::size_of::<i16>() * slot_index as usize;
-        read_u16(&self.data, start) as usize
+    pub fn page_size(&self) -> usize {
+        self.data.len()
     }
 }
 
 pub trait DbColumn
 where
-    Self: PartialEq + PartialOrd,
+    Self: PartialEq + PartialOrd + Clone + Sized,
 {
     fn from_bytes(bytes: &[u8], start: usize) -> Self;
     fn to_bytes(&self) -> Vec<u8>;
+    fn len(&self) -> usize;
 }
 
 impl DbColumn for u64 {
@@ -137,5 +127,44 @@ impl DbColumn for u64 {
 
     fn to_bytes(&self) -> Vec<u8> {
         u64::to_be_bytes(*self).into_iter().collect()
+    }
+
+    fn len(&self) -> usize {
+        size_of::<u64>()
+    }
+}
+
+#[cfg(test)]
+mod PageTest {
+    use crate::page::{PageType, HEADER_SIZE};
+
+    use super::{Page, PageHeader, PAGE_MAGIC_NUMBER};
+
+    #[test]
+    pub fn test_read_write_header() {
+        let mut page = Page {
+            page_id: 0xABCDEF,
+            data: vec![0; 1024],
+            is_dirty: false,
+        };
+
+        let header = PageHeader {
+            log_sequence_number: 0xAFAFAFE,
+            magic_number: PAGE_MAGIC_NUMBER,
+            page_type: PageType::DataPage,
+            page_id: 0xABCDEF,
+            parent_page_id: 0xFEDCBA,
+        };
+
+        page.write_header(header);
+
+        let header = page.read_header();
+
+        assert!(page.is_dirty);
+        assert_eq!(0xAFAFAFE, header.log_sequence_number);
+        assert_eq!(PAGE_MAGIC_NUMBER, header.magic_number);
+        assert_eq!(PageType::DataPage, header.page_type);
+        assert_eq!(0xABCDEF, header.page_id);
+        assert_eq!(0xFEDCBA, header.parent_page_id);
     }
 }
